@@ -2,29 +2,36 @@
 
 ## Goal
 
-Build a minimal server that connects to a Zalo Official Account (OA). When a user opens the OA on Zalo and sends any message, the server automatically replies with a "Hello" message.
+Build a minimal server that connects to a Zalo Official Account (OA). When a user opens the OA on Zalo and sends any message (text, image, file, or audio), the server automatically replies with a "Hello" message and can process/store media attachments.
 
 ---
 
 ## How It Works
 
 ```
-User sends message on Zalo
+User sends message on Zalo (text, image, file, audio, video)
         │
         ▼
 Zalo servers receive message
         │
         ▼
 Zalo POSTs webhook event to your server
-(event: "user_send_text", contains sender user_id + message text)
+(event: "user_send_text" / "user_send_image" / "user_send_file" / "user_send_audio")
+        │
+        ▼
+Your server processes the event:
+  - Text → extract message text
+  - Image → download from message.photo_url
+  - File → download from message.url
+  - Audio → download from message.url
         │
         ▼
 Your server calls Zalo OA Reply API
 POST https://openapi.zalo.me/v3.0/oa/message/cs
-(sends "Hello!" back to the user)
+(sends "Hello!" back to the user, optionally with media attachments)
         │
         ▼
-User sees "Hello!" reply in Zalo chat
+User sees reply in Zalo chat
 ```
 
 ---
@@ -38,7 +45,7 @@ Before writing any code, you need these accounts/configs:
 3. **Create/Link a Zalo Official Account** — create at https://oa.zalo.me if you don't have one, then link it to your app
 4. **Request API permissions** — in your app settings, go to API Registration and request the "send message" permission, submit for review
 5. **Get initial Access Token** — use the API Explorer at https://developers.zalo.me/tools/explorer to generate your first OA Access Token + Refresh Token
-6. **Configure Webhook** — in your app's Webhook settings, register your server's public URL (e.g. `https://your-domain.com/webhook`). Subscribe to the "user_send_text" event
+6. **Configure Webhook** — in your app's Webhook settings, register your server's public URL (e.g. `https://your-domain.com/webhook`). Subscribe to these events: `user_send_text`, `user_send_image`, `user_send_file`, `user_send_audio`
 
 ---
 
@@ -77,22 +84,89 @@ zalo-integration/
 
 ## Key API Details
 
-### Webhook Event (incoming — Zalo → Your Server)
+### Webhook Events (incoming — Zalo → Your Server)
 
-When a user sends a text message to your OA, Zalo sends a POST to your webhook URL:
+When a user sends a message to your OA, Zalo POSTs to your webhook URL. The payload varies by event type:
 
+#### `user_send_text`
 ```json
 {
   "event_name": "user_send_text",
-  "sender": {
-    "id": "<user_id>"
-  },
-  "message": {
-    "text": "Hi there"
-  },
+  "sender": { "id": "<user_id>" },
+  "message": { "text": "Hi there", "msg_id": "<msg_id>" },
   "timestamp": "1750316131602"
 }
 ```
+
+#### `user_send_image`
+**Important:** The image URL field is `photo_url`, NOT `photo`.
+```json
+{
+  "event_name": "user_send_image",
+  "sender": { "id": "<user_id>" },
+  "message": { "photo_url": "https://...", "msg_id": "<msg_id>" },
+  "timestamp": "..."
+}
+```
+
+#### `user_send_file`
+```json
+{
+  "event_name": "user_send_file",
+  "sender": { "id": "<user_id>" },
+  "message": { "url": "https://...", "msg_id": "<msg_id>" },
+  "timestamp": "..."
+}
+```
+
+#### `user_send_audio`
+```json
+{
+  "event_name": "user_send_audio",
+  "sender": { "id": "<user_id>" },
+  "message": { "url": "https://...", "msg_id": "<msg_id>" },
+  "timestamp": "..."
+}
+```
+
+#### Webhook Security
+
+Zalo signs webhook requests with HMAC SHA256 using your OA Secret Key. Verify the `mac` field in the payload to ensure the request is authentic.
+
+### Upload APIs (Your Server → Zalo)
+
+Before sending media messages back to users, you must upload the media to Zalo first. All upload endpoints use `multipart/form-data` with the `access_token` in the header.
+
+| Media Type | Endpoint                                            |
+| ---------- | --------------------------------------------------- |
+| Image      | `POST https://openapi.zalo.me/v3.0/oa/upload/image` |
+| GIF        | `POST https://openapi.zalo.me/v3.0/oa/upload/gif`   |
+| File       | `POST https://openapi.zalo.me/v3.0/oa/upload/file`  |
+
+**Headers:**
+```
+access_token: <YOUR_OA_ACCESS_TOKEN>
+```
+
+**Body:** `multipart/form-data` with a `file` field containing the binary data.
+
+**Response:** Returns an `attachment_id` (images/GIFs) or `token` (files) for use in messages.
+
+**Python example — upload image:**
+```python
+def upload_image(access_token: str, file_path: str) -> str:
+    with open(file_path, "rb") as f:
+        resp = requests.post(
+            "https://openapi.zalo.me/v3.0/oa/upload/image",
+            headers={"access_token": access_token},
+            files={"file": f},
+            timeout=30,
+        )
+    data = resp.json()
+    return data["data"]["attachment_id"]
+```
+
+Same pattern applies for `/upload/file` and `/upload/gif`. Audio does not have a dedicated upload endpoint — use `/upload/file` instead.
 
 ### Reply API (outgoing — Your Server → Zalo)
 
@@ -104,14 +178,55 @@ Content-Type: application/json
 access_token: <YOUR_OA_ACCESS_TOKEN>
 ```
 
-**Body:**
+#### Send text reply:
 ```json
 {
-  "recipient": {
-    "user_id": "<user_id_from_webhook>"
-  },
+  "recipient": { "user_id": "<user_id>" },
+  "message": { "text": "Hello!" }
+}
+```
+
+#### Send image reply (by attachment_id from upload):
+```json
+{
+  "recipient": { "user_id": "<user_id>" },
   "message": {
-    "text": "Hello!"
+    "attachment": {
+      "type": "template",
+      "payload": {
+        "template_type": "media",
+        "elements": [{ "media_type": "image", "attachment_id": "<id>" }]
+      }
+    }
+  }
+}
+```
+
+#### Send image reply (by URL — must be https):
+```json
+{
+  "recipient": { "user_id": "<user_id>" },
+  "message": {
+    "attachment": {
+      "type": "template",
+      "payload": {
+        "template_type": "media",
+        "elements": [{ "media_type": "image", "url": "https://..." }]
+      }
+    }
+  }
+}
+```
+
+#### Send file reply (by token from upload):
+```json
+{
+  "recipient": { "user_id": "<user_id>" },
+  "message": {
+    "attachment": {
+      "type": "file",
+      "payload": { "token": "<file_token>" }
+    }
   }
 }
 ```
@@ -160,8 +275,12 @@ PORT=3000
 
 The server needs to:
 1. Listen for POST requests on `/webhook`
-2. On `user_send_text` events, extract the sender's `user_id`
-3. Call the Zalo Reply API to send "Hello!" back
+2. Handle multiple event types:
+   - `user_send_text` → extract `message.text`
+   - `user_send_image` → extract `message.photo_url`, download the image
+   - `user_send_file` → extract `message.url`, download the file
+   - `user_send_audio` → extract `message.url`, download the audio
+3. Call the Zalo Reply API to send "Hello!" back (optionally with media)
 4. Auto-refresh the access token before it expires (every ~55 minutes)
 
 ### Step 4: Run locally with ngrok
@@ -187,3 +306,18 @@ Then copy the ngrok HTTPS URL into your Zalo App's webhook settings.
 - **Token refresh is critical**: Access tokens only last 1 hour. The app must auto-refresh or it will stop working.
 - **Webhook must be HTTPS**: Zalo requires an HTTPS endpoint. Use ngrok for local dev, or deploy behind a reverse proxy with TLS for production.
 - **OA verification**: Some API features require your OA to be verified (business registration). Basic messaging should work without it for testing.
+- **Media URLs from webhooks may expire**: Zalo hosts user-sent media on its CDN. Download files promptly if you need to persist them.
+- **Outbound images must be https:// URLs**: Local file paths are rejected. If you generate images locally, upload them via the upload API first.
+- **No dedicated audio upload endpoint**: Use `/v3.0/oa/upload/file` for audio files.
+- **`photo_url` not `photo`**: Inbound image webhooks use `message.photo_url` for the image URL. Using `message.photo` will fail silently (it's undefined).
+- **Webhook MAC verification**: Validate the `mac` field using HMAC SHA256 with your OA Secret Key to prevent spoofed requests.
+
+---
+
+## Reference Links
+
+- Webhook events: https://developers.zalo.me/docs/official-account/webhook/tin-nhan/su-kien-nguoi-dung-gui-tin-nhan
+- Upload image API: https://developers.zalo.me/docs/official-account/tin-nhan/quan-ly-tin-nhan/upload-hinh-anh
+- Upload file API: https://developers.zalo.me/docs/official-account/tin-nhan/quan-ly-tin-nhan/upload-file
+- Send message with image: https://developers.zalo.me/docs/api/official-account-api/gui-tin-va-thong-bao-qua-oa/v3/tin-tu-van/gui-tin-tu-van-dinh-kem-hinh-anh-post-7133
+- Send message with file: https://developers.zalo.me/docs/api/official-account-api/gui-tin-va-thong-bao-qua-oa/v3/tin-tu-van/gui-tin-tu-van-dinh-kem-file-post-7137
