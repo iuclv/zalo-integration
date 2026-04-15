@@ -1,6 +1,4 @@
 import os
-import threading
-import time
 import logging
 
 import requests
@@ -50,18 +48,11 @@ def refresh_access_token():
         logger.error("Token refresh failed: %s", data)
 
 
-def token_refresh_loop():
-    """Background thread that refreshes the access token every 55 minutes."""
-    while True:
-        time.sleep(55 * 60)
-        try:
-            refresh_access_token()
-        except Exception:
-            logger.exception("Error refreshing token")
+def _is_token_invalid(resp: requests.Response, data: dict) -> bool:
+    return resp.status_code == 401 or data.get("error") == -201
 
 
-def send_reply(user_id: str, text: str):
-    """Send a text message to a Zalo user via the OA Reply API."""
+def _send_message(user_id: str, text: str) -> tuple[requests.Response, dict]:
     resp = requests.post(
         ZALO_MESSAGE_API,
         headers={
@@ -74,7 +65,23 @@ def send_reply(user_id: str, text: str):
         },
         timeout=10,
     )
-    data = resp.json()
+    return resp, resp.json()
+
+
+def send_reply(user_id: str, text: str):
+    """Send a text message to a Zalo user, refreshing the token on auth errors."""
+    resp, data = _send_message(user_id, text)
+
+    if _is_token_invalid(resp, data):
+        logger.warning("Access token invalid (HTTP %s, error %s), refreshing…",
+                        resp.status_code, data.get("error"))
+        try:
+            refresh_access_token()
+        except Exception:
+            logger.exception("Token refresh failed")
+            return data
+        resp, data = _send_message(user_id, text)
+
     if data.get("error") != 0:
         logger.error("Failed to send message: %s", data)
     else:
@@ -104,9 +111,6 @@ def health():
 
 
 if __name__ == "__main__":
-    refresh_thread = threading.Thread(target=token_refresh_loop, daemon=True)
-    refresh_thread.start()
-
     port = int(os.getenv("PORT", 3000))
     logger.info("Starting server on port %d", port)
     app.run(host="0.0.0.0", port=port)
